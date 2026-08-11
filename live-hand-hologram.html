@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Live Hand Hologram</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070d; overflow: hidden; }
+  #stage { position: relative; width: 100vw; height: 100vh; }
+  video, canvas {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    max-width: 100vw; max-height: 100vh;
+  }
+  video { visibility: hidden; } /* we draw the video INTO the canvas ourselves */
+  #status {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    font: 14px/1.4 -apple-system, sans-serif; color: #9fd8ff;
+    background: rgba(0,0,0,0.55); padding: 8px 12px; border-radius: 8px;
+    max-width: 320px;
+  }
+  #startBtn {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    z-index: 20; font: 600 16px -apple-system, sans-serif;
+    padding: 14px 28px; border-radius: 999px; border: none;
+    background: #38bdf8; color: #04121a; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline autoplay muted></video>
+  <canvas id="out"></canvas>
+  <div id="status">Loading model…</div>
+  <button id="startBtn" style="display:none">Start camera</button>
+</div>
+
+<script type="module">
+// ---------------------------------------------------------------
+// Live version of the hand-tracking-overlays skill's batch pipeline.
+// Same core idea (openness signal -> hysteresis state -> eased envelope
+// -> procedural ring), rebuilt causal (no reading ahead) for a live feed.
+// See conversation notes for what changes vs. the offline version and why.
+// ---------------------------------------------------------------
+
+import {
+  HandLandmarker,
+  FilesetResolver,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1";
+
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+const video = document.getElementById("cam");
+const canvas = document.getElementById("out");
+const ctx = canvas.getContext("2d");
+
+// ---- tunables (same spirit as render_hand_overlay.py's CLI flags) ----
+const OPEN_HIGH = 0.75;       // openness_norm to confirm "open"
+const OPEN_LOW = 0.65;        // openness_norm to confirm "closed"
+const CONFIRM_FRAMES = 4;     // consecutive frames required before flipping state (causal debounce)
+const ENVELOPE_RATE = 9.0;    // higher = faster grow/shrink (exponential approach rate, per second)
+const POSITION_SMOOTH = 0.35; // 0..1, lower = smoother/laggier position
+const RADIUS_SMOOTH = 0.15;   // smoothing on the live target-radius estimate
+const RING_COLOR = "80,220,255";
+const RIM_COLOR = "190,245,255";
+
+const PALM_PTS = [0, 5, 9, 13, 17];
+const FINGERTIPS = [4, 8, 12, 16, 20];
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// ---- state (all causal — only ever looks at the past) ----
+let smoothedOpenness = null;
+let confirmedOpen = false;
+let risingCount = 0, fallingCount = 0;
+let envelope = 0;             // 0..1, eased toward confirmedOpen's target
+let smoothedX = null, smoothedY = null;
+let smoothedRadius = 60;
+let lastTs = performance.now();
+
+function updateSignal(hand, w, h) {
+  // landmarks are normalized [0,1] — convert to pixel space first
+  const px = hand.map((p) => ({ x: p.x * w, y: p.y * h }));
+  const palm = {
+    x: PALM_PTS.reduce((s, i) => s + px[i].x, 0) / 5,
+    y: PALM_PTS.reduce((s, i) => s + px[i].y, 0) / 5,
+  };
+  const href = dist(px[0], px[9]) || 1e-6;
+  const opx = FINGERTIPS.reduce((s, i) => s + dist(px[i], palm), 0) / 5;
+  const onorm = opx / href;
+  return { palm, opx, onorm };
+}
+
+function drawRing(cx, cy, radius, alpha) {
+  if (radius < 1) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  // soft glow
+  ctx.shadowBlur = 22;
+  ctx.shadowColor = `rgba(${RING_COLOR},0.9)`;
+  ctx.strokeStyle = `rgba(${RING_COLOR},0.85)`;
+  ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.stroke();
+  // crisp rim on top
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = `rgba(${RIM_COLOR},0.95)`;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.stroke();
+  // inner secondary ring
+  const innerR = radius * 0.72;
+  if (innerR > 1) {
+    ctx.strokeStyle = `rgba(${RING_COLOR},0.55)`;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, innerR, 0, Math.PI * 2); ctx.stroke();
+  }
+  // tick marks
+  const tickLen = Math.max(4, radius * 0.12);
+  ctx.strokeStyle = `rgba(${RIM_COLOR},0.85)`;
+  ctx.lineWidth = 2;
+  for (const ang of [0, 90, 180, 270]) {
+    const rad = (ang * Math.PI) / 180;
+    const ox = cx + Math.cos(rad) * radius, oy = cy + Math.sin(rad) * radius;
+    const ex = cx + Math.cos(rad) * (radius + tickLen), ey = cy + Math.sin(rad) * (radius + tickLen);
+    ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ex, ey); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+let handLandmarker;
+
+async function createLandmarker(vision, delegate) {
+  return HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate,
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.4,
+    minTrackingConfidence: 0.4,
+  });
+}
+
+async function init() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm"
+  );
+  try {
+    handLandmarker = await createLandmarker(vision, "GPU");
+  } catch (e) {
+    console.warn("GPU delegate failed, falling back to CPU:", e);
+    handLandmarker = await createLandmarker(vision, "CPU");
+  }
+  statusEl.textContent = "Model loaded. Click to start your camera.";
+  startBtn.style.display = "block";
+}
+
+async function startCamera() {
+  startBtn.style.display = "none";
+  statusEl.textContent = "Requesting camera…";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    statusEl.textContent = "Open your hand to summon the ring.";
+    requestAnimationFrame(loop);
+  } catch (err) {
+    statusEl.textContent = "Camera access failed: " + err.message +
+      " — this needs a real https:// page or localhost, and browser permission.";
+  }
+}
+
+function loop(nowMs) {
+  const dt = Math.min(0.1, (nowMs - lastTs) / 1000); // clamp for tab-switch pauses
+  lastTs = nowMs;
+
+  // draw the camera frame, mirrored (selfie-style)
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.translate(-canvas.width, 0);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  const result = handLandmarker.detectForVideo(video, nowMs);
+
+  if (result.landmarks && result.landmarks.length > 0) {
+    const { palm, opx, onorm } = updateSignal(result.landmarks[0], canvas.width, canvas.height);
+
+    smoothedOpenness = smoothedOpenness == null ? onorm : smoothedOpenness * 0.6 + onorm * 0.4;
+
+    if (smoothedOpenness >= OPEN_HIGH) { risingCount++; fallingCount = 0; }
+    else if (smoothedOpenness <= OPEN_LOW) { fallingCount++; risingCount = 0; }
+    else { risingCount = 0; fallingCount = 0; }
+
+    if (risingCount >= CONFIRM_FRAMES) confirmedOpen = true;
+    if (fallingCount >= CONFIRM_FRAMES) confirmedOpen = false;
+
+    // mirror the x coordinate to match the mirrored video draw
+    const px = canvas.width - palm.x;
+    const py = palm.y;
+    smoothedX = smoothedX == null ? px : smoothedX + (px - smoothedX) * POSITION_SMOOTH;
+    smoothedY = smoothedY == null ? py : smoothedY + (py - smoothedY) * POSITION_SMOOTH;
+
+    if (confirmedOpen) {
+      smoothedRadius = smoothedRadius + (opx - smoothedRadius) * RADIUS_SMOOTH;
+    }
+  } else {
+    // no hand this frame — let debounce counters lapse naturally, don't force-close instantly
+    risingCount = 0; fallingCount = 0;
+  }
+
+  const target = confirmedOpen ? 1 : 0;
+  envelope += (target - envelope) * (1 - Math.exp(-ENVELOPE_RATE * dt));
+
+  if (envelope > 0.005 && smoothedX != null) {
+    const alpha = Math.min(1, envelope * 3);
+    drawRing(smoothedX, smoothedY, smoothedRadius * envelope, alpha);
+  }
+
+  requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener("click", startCamera);
+init().catch((e) => { statusEl.textContent = "Failed to load model: " + e.message; });
+</script>
+</body>
+</html>
